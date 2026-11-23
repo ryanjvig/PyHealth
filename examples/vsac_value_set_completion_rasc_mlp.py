@@ -38,10 +38,9 @@ for every other trained model X are paired on the same resamples, per seed.
 
 Usage:
 
-    # Smoke test on generated value sets with a stub encoder (under a
-    # minute). Its scores carry no signal: the corpus has ~40 test sets and
-    # its retrieval score alone is near chance.
-    python examples/vsac_value_set_completion_rasc_mlp.py --synthetic
+    # Synthetic corpus and stub encoder, CPU (about 1 minute per seed).
+    python examples/vsac_value_set_completion_rasc_mlp.py --synthetic \\
+        --seeds 0 1 2
 
     # Real VSAC download (expansions/ + split_manifest.jsonl), on a GPU.
     python examples/vsac_value_set_completion_rasc_mlp.py --root vsac_corpus \\
@@ -55,15 +54,54 @@ the benchmark's train, val and test sets, as in the paper's 11,803-title
 index). Results go to ``--output``: ``results.json``, ``results.md``, and
 ``per_set_<model>_seed<seed>.csv``.
 
-Results: not yet run on VSAC.
+Synthetic setup (``--synthetic``, see :func:`write_synthetic`): 180 value
+sets (12 topics x 3 aspects x 5 variants; 108 train, 36 val, 36 test),
+bag-of-words stub encoder, K=5, 15 epochs at most, patience 3, batch 256,
+AdamW (lr 3e-4, weight decay 1e-4), seeds 0-2, CPU. 1,737 test pairs.
+
+Findings on synthetic data (mean +/- SD over 3 seeds):
+
+    Model              VS F1            Pair AUROC
+    retrieval_only     0.371            n/a
+    pyhealth_mlp       0.333 +/- 0.035  0.553 +/- 0.039
+    rasc_mlp           0.416 +/- 0.028  0.717 +/- 0.047
+    rasc_no_bn         0.385 +/- 0.028  0.671 +/- 0.087
+    rasc_no_dropout    0.426 +/- 0.015  0.728 +/- 0.033
+    rasc_dropout_0.5   0.366 +/- 0.029  0.668 +/- 0.042
+    rasc_shallow       0.310 +/- 0.036  0.662 +/- 0.033
+    rasc_deep          0.423 +/- 0.053  0.740 +/- 0.052
+    rasc_lr_1e-4       0.376 +/- 0.022  0.656 +/- 0.038
+    rasc_lr_1e-3       0.406 +/- 0.079  0.734 +/- 0.073
+
+- One concatenated MLP beats per-input towers: rasc_mlp exceeds
+  pyhealth_mlp in pair AUROC by 0.14-0.18 in every seed (paired 95% CIs
+  exclude 0) and in value-set F1 by 0.02-0.13 (CI excludes 0 in 2 of 3
+  seeds). pyhealth_mlp falls below retrieval only; rasc_mlp rises above it.
+  This matches the direction of the real-data gap reported by the sibling
+  example (PyHealth MLP 0.730 / 0.187 vs paper MLP 0.799 / 0.250).
+- BatchNorm explains part of the gain: removing it costs 0.03 F1 and 0.05
+  AUROC on average, but the paired CI excludes 0 for AUROC in only 2 of 3
+  seeds. Most of the gap over pyhealth_mlp comes from the rest of the
+  design (one MLP over the concatenated inputs, dropout, layer widths),
+  which this script does not separate further.
+- Capacity: one hidden layer of 256 (rasc_shallow) is clearly worse (F1
+  0.310); a deeper MLP adds nothing over the paper's 512-256-64.
+- Dropout 0 and 0.3 are close; 0.5 hurts. lr 1e-4 underfits within 15
+  epochs; lr 1e-3 matches on average but is the least stable across seeds.
+
+Caveats: 36 synthetic test sets, a stub encoder and a 15-epoch cap, so
+these numbers are not comparable with the paper's and the intervals are
+wide. Real VSAC results are pending UMLS access.
 """
 
 import argparse
 import json
+import random
 import shutil
-import sys
 import tempfile
+import zlib
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -87,14 +125,6 @@ from pyhealth.tasks import ValueSetCompletion, build_retrieval_index
 from pyhealth.tasks.value_set_completion import sapbert_encoder
 from pyhealth.trainer import Trainer
 
-# The synthetic corpus and stub encoder of the sibling example.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from vsac_value_set_completion_mlp import (
-    SYNTHETIC_CAP,
-    stub_encoder,
-    write_synthetic,
-)
-
 REFERENCE = "rasc_mlp"
 # name -> (RASCMLP keyword arguments, learning rate or None for --lr).
 RASC_CONFIGS: dict[str, tuple[dict[str, Any], float | None]] = {
@@ -108,6 +138,110 @@ RASC_CONFIGS: dict[str, tuple[dict[str, Any], float | None]] = {
     "rasc_lr_1e-3": ({}, 1e-3),
 }
 MODELS = ("retrieval_only", "pyhealth_mlp", *RASC_CONFIGS)
+
+
+SNOMED = "http://snomed.info/sct"
+LOINC = "http://loinc.org"
+RXNORM = "http://www.nlm.nih.gov/research/umls/rxnorm"
+# Synthetic aspect -> (title/display word, code system, value set type).
+ASPECTS = (
+    ("disorder", SNOMED, "Condition/Clinical"),
+    ("lab", LOINC, "Lab/Observation"),
+    ("medication", RXNORM, "Medication"),
+)
+TOPICS = (
+    "asthma", "diabetes", "hypertension", "sepsis", "stroke", "anemia",
+    "migraine", "obesity", "pneumonia", "hepatitis", "lupus", "gout",
+)
+SPLITS = ("train", "train", "train", "val", "test")
+
+
+def stub_encoder(texts: Sequence[str]) -> np.ndarray:
+    """Unit-norm bag-of-words hashing encoder; stands in for SapBERT.
+
+    Texts that share words get higher cosine similarity, which is all the
+    synthetic corpus relies on.
+
+    Args:
+        texts: Texts to encode.
+
+    Returns:
+        A float32 array of shape ``(len(texts), 64)``.
+    """
+    vecs = np.zeros((len(texts), 64), dtype=np.float32)
+    for i, text in enumerate(texts):
+        for word in text.lower().split():
+            vecs[i, zlib.crc32(word.encode()) % 64] += 1.0
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    return vecs / np.where(norms == 0, 1.0, norms)
+
+
+def write_synthetic(root: Path, seed: int = 0) -> None:
+    """Writes a synthetic VSAC download whose signals mimic the real task.
+
+    Each value set covers one topic (e.g. asthma) and one aspect (disorder,
+    lab or medication, each with its own code system), and draws most codes
+    from that topic-aspect's pool of 30. Titles are ``"<topic> <aspect>
+    <unique word>"`` and displays ``"<topic> <aspect> <unique word>"``, so:
+
+    - Sets on the same topic and aspect share two title words and get the
+      top retrieval scores; same-topic sets of other aspects share one word
+      and contribute candidates that are mostly negatives.
+    - A true candidate's display shares the aspect word with the title.
+    - The code system matches the aspect.
+
+    One set in five also has 1-3 codes from another aspect of its topic, so
+    no single signal separates the classes. 12 topics x 3 aspects x 5
+    variants give 180 value sets: 108 train, 36 val, 36 test.
+
+    Args:
+        root: Output directory; gets ``expansions/`` and
+            ``split_manifest.jsonl``.
+        seed: Random seed.
+    """
+    rng = random.Random(seed)
+    exp_dir = root / "expansions"
+    exp_dir.mkdir(parents=True)
+    manifest = []
+    for t, topic in enumerate(TOPICS):
+        pools = [
+            [(f"{t}{a}{c:02d}", f"{topic} {word} w{t}x{a}x{c}") for c in range(30)]
+            for a, (word, _, _) in enumerate(ASPECTS)
+        ]
+        for a, (word, system, value_set_type) in enumerate(ASPECTS):
+            for v, split in enumerate(SPLITS):
+                oid = f"9.{t}.{a}.{v}-20240101"
+                drawn = rng.sample(pools[a], rng.randint(8, 20))
+                members = [(system, *m) for m in drawn]
+                if rng.random() < 0.2:
+                    b = rng.choice([x for x in range(len(ASPECTS)) if x != a])
+                    extra = rng.sample(pools[b], rng.randint(1, 3))
+                    members += [(ASPECTS[b][1], *m) for m in extra]
+                resource = {
+                    "resourceType": "ValueSet",
+                    "id": oid,
+                    "title": f"{topic} {word} v{t}x{a}x{v}",
+                    "version": "20240101",
+                    "expansion": {
+                        "total": len(members),
+                        "contains": [
+                            {"system": sys_uri, "code": code, "display": display}
+                            for sys_uri, code, display in members
+                        ],
+                    },
+                }
+                (exp_dir / f"{oid}.json").write_text(json.dumps(resource))
+                manifest.append(
+                    {
+                        "oid": oid,
+                        "split": split,
+                        "type": value_set_type,
+                        "publisher": "Synthetic Steward",
+                    }
+                )
+    (root / "split_manifest.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in manifest)
+    )
 
 
 def build_model(name: str, train: Any, lr: float) -> tuple[torch.nn.Module, float]:
@@ -444,16 +578,16 @@ def main() -> None:
     work = Path(tempfile.mkdtemp()) if args.synthetic else None
     task_args: dict[str, Any] = {"k": args.k}
     if args.synthetic:
-        write_synthetic(work / "vsac", n_topics=20)
+        write_synthetic(work / "vsac")
         args.root = str(work / "vsac")
         args.cache_dir = str(work / "cache")
         args.index_dir = args.index_dir or str(work / "index")
-        args.source_splits = ["train", "val", "test", "corpus"]
-        args.epochs = min(args.epochs, 5)
-        args.batch_size = min(args.batch_size, 128)
+        args.epochs = min(args.epochs, 15)
+        args.patience = min(args.patience, 3)
+        args.batch_size = min(args.batch_size, 256)
         args.n_boot = min(args.n_boot, 200)
         args.pair_n_boot = min(args.pair_n_boot, 50)
-        task_args.update(k=min(args.k, 5), max_codes_per_set=SYNTHETIC_CAP)
+        task_args.update(k=min(args.k, 5))
     dataset = VSACDataset(root=args.root, cache_dir=args.cache_dir)
     index_dir = args.index_dir or str(Path(args.output) / "index")
     if not (Path(index_dir) / "meta.json").exists():
