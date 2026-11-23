@@ -36,6 +36,9 @@ routes each feature type automatically.
    * - :doc:`models/pyhealth.models.MLP`
      - Features are static numeric vectors (aggregated lab values, demographics)
      - Fully connected; no notion of sequence order
+   * - :doc:`models/pyhealth.models.RASCMLP`
+     - Features are fixed-length vectors to score jointly (e.g. ``ValueSetCompletion`` pairs)
+     - One MLP over the concatenated inputs, with BatchNorm and dropout
    * - ``MultimodalRNN``
      - Features mix sequential codes with static tensors or multi-hot encodings
      - Auto-routes sequential features to RNN layers and non-sequential features to linear layers; good default for EHR
@@ -294,6 +297,7 @@ API Reference
     models/pyhealth.models.NeuralFineGray
     models/pyhealth.models.LogisticRegression
     models/pyhealth.models.MLP
+    models/pyhealth.models.RASCMLP
     models/pyhealth.models.CNN
     models/pyhealth.models.UNet
     models/pyhealth.models.RNN

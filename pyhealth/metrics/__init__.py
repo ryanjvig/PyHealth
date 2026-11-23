@@ -56,6 +56,13 @@ from .survival_curve import (
     integrated_brier_score_td,
     survival_curve_metrics_fn,
 )
+from .value_set import (
+    best_f1_threshold,
+    value_set_bootstrap_ci,
+    value_set_paired_bootstrap_diff,
+    value_set_scores,
+    value_set_summary,
+)
 
 __all__ = [
     "CensoringDistribution",
@@ -67,6 +74,7 @@ __all__ = [
     "RemovalBasedMetric",
     "SufficiencyMetric",
     "alert_rate_metrics",
+    "best_f1_threshold",
     "binary_metrics_fn",
     "bootstrap_ci",
     "calc_membership_inference",
@@ -106,4 +114,8 @@ __all__ = [
     "survival_metrics_fn",
     "timeseries_binary_metrics_fn",
     "timeseries_regression_metrics_fn",
+    "value_set_bootstrap_ci",
+    "value_set_paired_bootstrap_diff",
+    "value_set_scores",
+    "value_set_summary",
 ]
