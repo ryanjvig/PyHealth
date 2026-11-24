@@ -49,6 +49,11 @@ Usage:
     python examples/vsac_value_set_completion_rasc_mlp.py --root vsac_corpus \\
         --models retrieval_only pyhealth_mlp rasc_mlp rasc_no_bn
 
+``--sample-frac`` keeps a fixed, OID-hashed fraction of target value sets
+(retrieval still searches every title); each pair stores two embeddings, so
+the full benchmark needs roughly 40 GB of sample cache. ``--resume`` skips
+models and seeds already finished in ``--output``.
+
 The retrieval index searches only value sets in ``--source-splits`` (default:
 the benchmark's train, val and test sets, as in the paper's 11,803-title
 index). Results go to ``--output``: ``results.json``, ``results.md``, and
@@ -242,6 +247,86 @@ def write_synthetic(root: Path, seed: int = 0) -> None:
     (root / "split_manifest.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in manifest)
     )
+
+
+class SampledValueSetCompletion(ValueSetCompletion):
+    """ValueSetCompletion on a fixed, OID-hashed fraction of target sets.
+
+    Retrieval still searches every indexed title; only the targets are
+    sampled. Hashing the OID gives every model and run the same sets.
+
+    Args:
+        index_dir: Output of ``build_retrieval_index``.
+        sample_frac: Fraction of value sets kept as targets, in ``(0, 1]``.
+        **kwargs: Passed to ``ValueSetCompletion``.
+
+    Raises:
+        ValueError: If ``sample_frac`` is outside ``(0, 1]``.
+    """
+
+    def __init__(self, index_dir: str, sample_frac: float = 1.0, **kwargs: Any):
+        if not 0.0 < sample_frac <= 1.0:
+            raise ValueError(f"sample_frac must be in (0, 1], got {sample_frac}.")
+        super().__init__(index_dir, **kwargs)
+        self.sample_frac = sample_frac
+
+    def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
+        """Keeps the events of the sampled value sets.
+
+        Args:
+            df: The dataset's global event frame.
+
+        Returns:
+            The frame restricted to sampled OIDs.
+        """
+        if self.sample_frac >= 1.0:
+            return df
+        cutoff = int(self.sample_frac * 2**32)
+        oids = df.select("patient_id").unique().collect()["patient_id"].to_list()
+        kept = [oid for oid in oids if zlib.crc32(oid.encode()) < cutoff]
+        return df.filter(pl.col("patient_id").is_in(kept))
+
+
+def save_run(
+    output: Path, record: dict, pairs: pd.DataFrame, per_set: pd.DataFrame
+) -> None:
+    """Saves one finished model and seed, so ``--resume`` can skip it.
+
+    Args:
+        output: Output directory.
+        record: The :func:`run_model` record.
+        pairs: Test pairs with predictions.
+        per_set: Per-set scores.
+    """
+    stem = f"{record['model']}_seed{record['seed']}"
+    runs = output / "finished"
+    runs.mkdir(parents=True, exist_ok=True)
+    pairs.to_parquet(runs / f"{stem}_pairs.parquet", index=False)
+    per_set.to_csv(output / f"per_set_{stem}.csv", index=False)
+    # Written last: its presence marks the run as complete.
+    (runs / f"{stem}.json").write_text(json.dumps(record, default=str))
+
+
+def load_run(
+    output: Path, name: str, seed: int
+) -> tuple[dict, pd.DataFrame, pd.DataFrame] | None:
+    """Loads a run saved by :func:`save_run`, or returns None.
+
+    Args:
+        output: Output directory.
+        name: Model name.
+        seed: Seed.
+
+    Returns:
+        The record, test pairs and per-set scores, or None if not saved.
+    """
+    stem = f"{name}_seed{seed}"
+    record_path = output / "finished" / f"{stem}.json"
+    if not record_path.exists():
+        return None
+    pairs = pd.read_parquet(output / "finished" / f"{stem}_pairs.parquet")
+    per_set = pd.read_csv(output / f"per_set_{stem}.csv", dtype={"set_id": str})
+    return json.loads(record_path.read_text()), pairs, per_set
 
 
 def build_model(name: str, train: Any, lr: float) -> tuple[torch.nn.Module, float]:
@@ -570,6 +655,17 @@ def main() -> None:
     parser.add_argument("--pair-n-boot", type=int, default=200)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--sample-frac",
+        type=float,
+        default=1.0,
+        help="Fraction of target value sets kept (OID-hashed); saves disk/time",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip models and seeds already saved in --output",
+    )
     args = parser.parse_args()
     unknown = set(args.models) - set(MODELS)
     if unknown or not (args.root or args.synthetic):
@@ -598,7 +694,9 @@ def main() -> None:
             max_k=max(task_args["k"], 10),
             source_splits=args.source_splits,
         )
-    task = ValueSetCompletion(index_dir, **task_args)
+    task = SampledValueSetCompletion(
+        index_dir, sample_frac=args.sample_frac, **task_args
+    )
     splits = dataset.set_task(
         task, num_workers=args.num_workers, split=dataset.manifest_split()
     )
@@ -617,11 +715,13 @@ def main() -> None:
         for name in args.models:
             if name == "retrieval_only" and seed != args.seeds[0]:
                 continue  # deterministic
-            record, pairs[name], per_sets[name] = run_model(
-                name, seed, splits, types, args
-            )
-            per_set_path = output / f"per_set_{name}_seed{seed}.csv"
-            per_sets[name].to_csv(per_set_path, index=False)
+            saved = load_run(output, name, seed) if args.resume else None
+            if saved is None:
+                saved = run_model(name, seed, splits, types, args)
+                save_run(output, *saved)
+            else:
+                print(f"Resuming: {name} seed {seed} already finished.")
+            record, pairs[name], per_sets[name] = saved
             results.append(record)
             write_report(results, comparisons, meta, output)
         if REFERENCE in pairs:
