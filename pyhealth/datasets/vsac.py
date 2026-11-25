@@ -50,6 +50,9 @@ VALUESET_COLUMNS = [
 CODE_COLUMNS = ["oid", "code", "system", "display", "rank"]
 # Dotted digits with an optional -<yyyymmdd> version. OIDs become file names.
 _OID_PATTERN = re.compile(r"\d+(?:\.\d+)+(?:-\d{8})?")
+# A FHIR resource id that is not an OID, e.g. "event-timing" in the released
+# manifest: VSAC cannot serve it, so such manifest rows are skipped.
+_FHIR_ID_PATTERN = re.compile(r"[A-Za-z0-9.-]{1,64}")
 
 # From create_dataset/build_dataset.py in the RASC repository.
 _SYSTEM_TYPES = {
@@ -157,25 +160,40 @@ def _read_manifest(path: Path) -> dict[str, dict[str, Any]]:
     Args:
         path: Manifest path.
 
+    Rows whose ``oid`` is a FHIR id but not an OID (the released manifest has
+    one, ``event-timing``, an HL7 value set that VSAC does not serve) are
+    skipped with a warning.
+
     Returns:
         One row per OID with ``split`` and optionally ``type`` and ``publisher``.
 
     Raises:
-        ValueError: If a line is not JSON or has no valid ``oid``.
+        ValueError: If a line is not JSON or its ``oid`` is missing or not a
+            valid id.
     """
     if not path.exists():
         return {}
-    rows = {}
+    rows, skipped = {}, []
     for number, line in enumerate(path.read_text().splitlines(), 1):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
-            if not _OID_PATTERN.fullmatch(row["oid"]):
-                raise ValueError(row["oid"])
-            rows[row["oid"]] = row
+            oid = row["oid"]
+            if not isinstance(oid, str):
+                raise TypeError(oid)
+            if _OID_PATTERN.fullmatch(oid):
+                rows[oid] = row
+            elif _FHIR_ID_PATTERN.fullmatch(oid):
+                skipped.append(oid)
+            else:
+                raise ValueError(oid)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise ValueError(f"{path}:{number}: invalid manifest row") from error
+    if skipped:
+        logger.warning(
+            f"Skipped {len(skipped)} manifest ids that are not OIDs: {skipped}"
+        )
     return rows
 
 

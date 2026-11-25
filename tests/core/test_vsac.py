@@ -317,6 +317,20 @@ class TestVSACDataset(VSACFixture):
         with self.assertRaisesRegex(ValueError, "invalid manifest row"):
             VSACDataset.prepare_metadata(str(root))
 
+    def test_manifest_skips_fhir_ids_that_are_not_oids(self):
+        # The released manifest has one such row, "event-timing".
+        root = self.tmp / "fhir_id"
+        write_fixture(root)
+        manifest = root / MANIFEST_FILE
+        row = '{"oid": "event-timing", "split": "train"}\n'
+        manifest.write_text(row + manifest.read_text())
+        with self.assertLogs("pyhealth.datasets.vsac", logging.WARNING) as logs:
+            VSACDataset.prepare_metadata(str(root))
+        self.assertIn("event-timing", " ".join(logs.output))
+        oids = (root / VALUESETS_FILE).read_text()
+        self.assertIn("1.2-20240101", oids)
+        self.assertNotIn("event-timing", oids)
+
     def test_download_rejects_path_like_oids(self):
         session = FakeSession()
         with self.assertRaisesRegex(ValueError, "Not VSAC OIDs"):
