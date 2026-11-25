@@ -115,7 +115,7 @@ import pandas as pd
 import polars as pl
 import torch
 
-from pyhealth.datasets import VSACDataset, get_dataloader
+from pyhealth.datasets import SubjectSplit, VSACDataset, get_dataloader
 from pyhealth.metrics import (
     best_f1_threshold,
     bootstrap_ci,
@@ -281,10 +281,37 @@ class SampledValueSetCompletion(ValueSetCompletion):
         """
         if self.sample_frac >= 1.0:
             return df
-        cutoff = int(self.sample_frac * 2**32)
         oids = df.select("patient_id").unique().collect()["patient_id"].to_list()
-        kept = [oid for oid in oids if zlib.crc32(oid.encode()) < cutoff]
+        kept = [oid for oid in oids if self.keeps(oid)]
         return df.filter(pl.col("patient_id").is_in(kept))
+
+    def keeps(self, oid: str) -> bool:
+        """Whether a value set is among the sampled targets.
+
+        Args:
+            oid: Value set OID.
+
+        Returns:
+            True if the OID's hash falls in the kept fraction.
+        """
+        return zlib.crc32(oid.encode()) < int(self.sample_frac * 2**32)
+
+    def split(self, split: SubjectSplit) -> SubjectSplit:
+        """Restricts a split to the sampled value sets.
+
+        Without this, ``set_task`` warns about every unsampled set.
+
+        Args:
+            split: The full split, e.g. ``dataset.manifest_split()``.
+
+        Returns:
+            The same parts, keeping only sampled OIDs.
+        """
+        if self.sample_frac >= 1.0:
+            return split
+        return SubjectSplit(
+            [[oid for oid in part if self.keeps(oid)] for part in split.subjects]
+        )
 
 
 def save_run(
@@ -698,7 +725,9 @@ def main() -> None:
         index_dir, sample_frac=args.sample_frac, **task_args
     )
     splits = dataset.set_task(
-        task, num_workers=args.num_workers, split=dataset.manifest_split()
+        task,
+        num_workers=args.num_workers,
+        split=task.split(dataset.manifest_split()),
     )
     types = value_set_types(dataset)
     meta = {
